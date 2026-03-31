@@ -162,9 +162,11 @@ static void run_mate_tests() {
 
         printf("  Searching: %s (depth %d)\n", test.name, test.depth);
         SearchResult result = search(pos, info);
-        printf("  Result: best=%s score=%d nodes=%d\n\n",
+        printf("  Result: best=%s score=%d nodes=%d tt_hits=%llu tt_cutoffs=%llu\n\n",
                move_to_string(result.best_move).c_str(),
-               result.score, result.nodes);
+               result.score, result.nodes,
+               (unsigned long long)result.tt_hits,
+               (unsigned long long)result.tt_cutoffs);
     }
 }
 
@@ -201,9 +203,11 @@ int main(int argc, char* argv[]) {
         info.depth = depth;
 
         SearchResult result = search(pos, info);
-        printf("\n  Best move: %s, Score: %d cp, Nodes: %d\n\n",
+        printf("\n  Best move: %s, Score: %d cp, Nodes: %d, TT hits: %llu, TT cutoffs: %llu\n\n",
                move_to_string(result.best_move).c_str(),
-               result.score, result.nodes);
+               result.score, result.nodes,
+               (unsigned long long)result.tt_hits,
+               (unsigned long long)result.tt_cutoffs);
         return 0;
     }
 
@@ -241,9 +245,11 @@ int main(int argc, char* argv[]) {
     SearchInfo info;
     info.depth = 6;
     SearchResult result = search(pos, info);
-    printf("\n  Best move: %s, Score: %d cp, Nodes: %d\n\n",
+    printf("\n  Best move: %s, Score: %d cp, Nodes: %d, TT hits: %llu, TT cutoffs: %llu\n\n",
            move_to_string(result.best_move).c_str(),
-           result.score, result.nodes);
+           result.score, result.nodes,
+           (unsigned long long)result.tt_hits,
+           (unsigned long long)result.tt_cutoffs);
 
     /* Run baseline tactical validation */
     run_mate_tests();

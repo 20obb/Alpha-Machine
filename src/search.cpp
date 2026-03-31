@@ -32,6 +32,7 @@
 #include "evaluate.h"
 #include "movegen.h"
 #include "bitboard.h"
+#include "tt.h"
 
 #include <cstdio>
 #include <chrono>
@@ -50,6 +51,14 @@ static void check_time(SearchInfo& info) {
         info.stopped = true;
 }
 
+static inline bool leaves_king_in_check(const Position& pos, Color us) {
+    return pos.is_attacked(pos.king_square(us), ~us);
+}
+
+static inline int mated_in(int ply) {
+    return -VALUE_MATE + ply;
+}
+
 /* ═══════════════════ Move Ordering (Simple) ═══════════════ */
 /*
  * Move ordering dramatically dictates alpha-beta performance yield.
@@ -62,23 +71,29 @@ static void check_time(SearchInfo& info) {
  *   - Quiet Moves: Baseline priority score 0 (upgraded later via killer/history).
  */
 
-static void score_moves(const Position& pos, MoveList& list) {
+static constexpr int HASH_MOVE_SCORE = 30000000;
+static constexpr int CAPTURE_SCORE_BASE = 10000000;
+static constexpr int PROMOTION_SCORE_BASE = 9000000;
+
+static void score_moves(const Position& pos, MoveList& list, Move hash_move = MOVE_NONE) {
     for (int i = 0; i < list.count; i++) {
         Move m = list.moves[i];
         Square to = move_to(m);
         Piece captured = pos.piece_on(to);
 
-        if (captured != NO_PIECE) {
+        if (m == hash_move) {
+            list.scores[i] = HASH_MOVE_SCORE;
+        } else if (captured != NO_PIECE) {
             /* MVV-LVA: victim_value * 10 - attacker_value */
             Piece moved = pos.piece_on(move_from(m));
             int victim_val = PieceValue[type_of(captured)];
             int attacker_val = PieceValue[type_of(moved)];
-            list.scores[i] = victim_val * 10 - attacker_val + 10000;
-            /* +10000 ensures ALL captures fundamentally outrank ALL quiet moves */
+            list.scores[i] = victim_val * 10 - attacker_val + CAPTURE_SCORE_BASE;
+            /* Captures outrank quiet moves; hash move outranks everything. */
         } else if (move_type(m) == MT_EN_PASSANT) {
-            list.scores[i] = 10500;  /* en passant mechanically acts as pawn capture */
+            list.scores[i] = CAPTURE_SCORE_BASE + 500;  /* En passant behaves like pawn capture. */
         } else if (move_type(m) == MT_PROMOTION) {
-            list.scores[i] = 9000 + PieceValue[promotion_type(m)];
+            list.scores[i] = PROMOTION_SCORE_BASE + PieceValue[promotion_type(m)];
         } else {
             list.scores[i] = 0;
         }
@@ -138,17 +153,24 @@ static int quiescence(Position& pos, int alpha, int beta, SearchInfo& info) {
     generate_captures(pos, captures);
     score_moves(pos, captures);
 
+    Color us = pos.side_to_move();
+
     for (int i = 0; i < captures.count; i++) {
         pick_move(captures, i);
 
         StateInfo si;
         pos.make_move(captures.moves[i], si);
+        if (leaves_king_in_check(pos, us)) {
+            pos.unmake_move(captures.moves[i]);
+            continue;
+        }
+
         int score = -quiescence(pos, -beta, -alpha, info);
         pos.unmake_move(captures.moves[i]);
 
         if (info.stopped) return 0;
 
-        if (score >= beta) return beta;
+        if (score >= beta) return score;
         if (score > alpha) alpha = score;
     }
 
@@ -170,7 +192,7 @@ static int quiescence(Position& pos, int alpha, int beta, SearchInfo& info) {
  */
 
 static int alpha_beta(Position& pos, int depth, int alpha, int beta,
-                       SearchInfo& info) {
+                      int ply, SearchInfo& info) {
     /* ─── Termination Overrides ──────────────────────────────── */
 
     if ((info.nodes & 2047) == 0) check_time(info);
@@ -185,22 +207,44 @@ static int alpha_beta(Position& pos, int depth, int alpha, int beta,
 
     info.nodes++;
 
+    int alpha_orig = alpha;
+    Move tt_move = MOVE_NONE;
+    TTEntry tt_entry;
+
+    info.tt_probes++;
+    if (g_tt.probe(pos.key(), tt_entry)) {
+        info.tt_hits++;
+        tt_move = tt_entry.best_move;
+
+        if (tt_entry.depth >= depth) {
+            int tt_score = TranspositionTable::score_from_tt(tt_entry.score, ply);
+
+            if (tt_entry.bound == TT_BOUND_EXACT) {
+                info.tt_cutoffs++;
+                return tt_score;
+            }
+            if (tt_entry.bound == TT_BOUND_LOWER && tt_score >= beta) {
+                info.tt_cutoffs++;
+                return tt_score;
+            }
+            if (tt_entry.bound == TT_BOUND_UPPER && tt_score <= alpha) {
+                info.tt_cutoffs++;
+                return tt_score;
+            }
+        }
+    }
+
     /* ─── Move Expansion ────────────────────── */
     MoveList moves;
     generate_moves(pos, moves);
 
-    /* Absence of legal execution array -> Checkmate or Stalemate mapping */
-    if (moves.count == 0) {
-        if (pos.in_check())
-            return -VALUE_MATE + info.nodes;  /* Checkmate state — prioritize mathematically shorter mates */
-        else
-            return 0;  /* Stalemate draw */
-    }
-
     /* Sequencing operations */
-    score_moves(pos, moves);
+    score_moves(pos, moves, tt_move);
 
+    Color us = pos.side_to_move();
     Move best_move = MOVE_NONE;
+    int best_score = -VALUE_INFINITE;
+    bool found_legal = false;
 
     for (int i = 0; i < moves.count; i++) {
         pick_move(moves, i);
@@ -208,34 +252,46 @@ static int alpha_beta(Position& pos, int depth, int alpha, int beta,
         /* Legality filtering */
         StateInfo si;
         pos.make_move(moves.moves[i], si);
-        if (pos.is_attacked(pos.king_square(pos.side_to_move() == WHITE ? BLACK : WHITE), pos.side_to_move())) {
+        if (leaves_king_in_check(pos, us)) {
             pos.unmake_move(moves.moves[i]);
             continue;
         }
 
-        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, info);
+        found_legal = true;
+
+        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, ply + 1, info);
         pos.unmake_move(moves.moves[i]);
 
         if (info.stopped) return 0;
 
+        if (score > best_score) {
+            best_score = score;
+            best_move = moves.moves[i];
+        }
+
         if (score > alpha) {
             alpha = score;
-            best_move = moves.moves[i];
-
-            if (score >= beta) {
-                /* Opponent ceiling breached */
-                return beta;
-            }
         }
+
+        if (alpha >= beta)
+            break;
     }
 
-    /* Fallback catch for an all-illegal move iteration resulting in Checkmate/Stalemate masking */
-    if (best_move == MOVE_NONE) {
-        if (pos.in_check()) return -VALUE_MATE + info.nodes;
-        return 0;
+    if (!found_legal) {
+        int terminal = pos.in_check() ? mated_in(ply) : 0;
+        g_tt.store(pos.key(), depth, terminal, MOVE_NONE, TT_BOUND_EXACT, ply);
+        info.tt_stores++;
+        return terminal;
     }
 
-    return alpha;
+    TTBound bound = TT_BOUND_EXACT;
+    if (best_score <= alpha_orig) bound = TT_BOUND_UPPER;
+    else if (best_score >= beta) bound = TT_BOUND_LOWER;
+
+    g_tt.store(pos.key(), depth, best_score, best_move, bound, ply);
+    info.tt_stores++;
+
+    return best_score;
 }
 
 /* ═══════════════════ Root Alpha-Beta ═════════════════════ */
@@ -249,22 +305,25 @@ static SearchResult root_search(Position& pos, int depth, SearchInfo& info) {
 
     MoveList moves;
     generate_moves(pos, moves);
-    score_moves(pos, moves);
+    score_moves(pos, moves, g_tt.probe_move(pos.key()));
 
     int alpha = -VALUE_INFINITE;
     int beta  =  VALUE_INFINITE;
+    Color us = pos.side_to_move();
+    bool found_legal = false;
 
     for (int i = 0; i < moves.count; i++) {
         pick_move(moves, i);
 
         StateInfo si;
         pos.make_move(moves.moves[i], si);
-        if (pos.is_attacked(pos.king_square(pos.side_to_move() == WHITE ? BLACK : WHITE), pos.side_to_move())) {
+        if (leaves_king_in_check(pos, us)) {
             pos.unmake_move(moves.moves[i]);
             continue;
         }
 
-        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, info);
+        found_legal = true;
+        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, 1, info);
         pos.unmake_move(moves.moves[i]);
 
         if (info.stopped) break;
@@ -276,18 +335,13 @@ static SearchResult root_search(Position& pos, int depth, SearchInfo& info) {
         }
     }
 
-    /* Fallback in case root checkmate processing yields nil array */
-    if (result.best_move == MOVE_NONE && moves.count > 0) {
-        for (int i = 0; i < moves.count; i++) {
-            StateInfo si;
-            pos.make_move(moves.moves[i], si);
-            bool ok = !pos.is_attacked(pos.king_square(pos.side_to_move() == WHITE ? BLACK : WHITE), pos.side_to_move());
-            pos.unmake_move(moves.moves[i]);
-            if (ok) {
-                result.best_move = moves.moves[i];
-                break;
-            }
-        }
+    if (!found_legal) {
+        result.score = pos.in_check() ? mated_in(0) : 0;
+    }
+
+    if (!info.stopped) {
+        g_tt.store(pos.key(), depth, result.score, result.best_move, TT_BOUND_EXACT, 0);
+        info.tt_stores++;
     }
 
     result.nodes = info.nodes;
@@ -308,6 +362,11 @@ SearchResult search(Position& pos, SearchInfo& info) {
     SearchResult best_result;
     info.nodes = 0;
     info.stopped = false;
+    info.tt_probes = 0;
+    info.tt_hits = 0;
+    info.tt_cutoffs = 0;
+    info.tt_stores = 0;
+    g_tt.new_search();
 
     int64_t search_start = current_time_ms();
 
@@ -349,6 +408,12 @@ SearchResult search(Position& pos, SearchInfo& info) {
             result.score < -VALUE_MATE + MAX_PLY)
             break;
     }
+
+    best_result.nodes = info.nodes;
+    best_result.tt_probes = info.tt_probes;
+    best_result.tt_hits = info.tt_hits;
+    best_result.tt_cutoffs = info.tt_cutoffs;
+    best_result.tt_stores = info.tt_stores;
 
     printf("bestmove %s\n", move_to_string(best_result.best_move).c_str());
     fflush(stdout);
