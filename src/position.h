@@ -51,8 +51,6 @@ struct StateInfo {
     /* The move that led to this state */
     Move          last_move;
 
-    /* Pointer to the previous state (linked list) */
-    StateInfo*    previous;
 };
 
 /* ═══════════════════ Position Class ════════════════════════ */
@@ -124,8 +122,14 @@ public:
     /* Execute a move — saves state to si */
     void make_move(Move m, StateInfo& si);
 
+    /* Execute a move using internal state storage */
+    void make_move(Move m);
+
     /* Revert the last move executed */
     void unmake_move(Move m);
+
+    /* Execute a legal move permanently */
+    bool do_move(Move m);
 
     /* Null move (passing the turn — used in search heuristics) */
     void make_null_move(StateInfo& si);
@@ -181,8 +185,9 @@ private:
     /* Current Zobrist hash key */
     U64 zobrist;
 
-    /* Pointer to the current state (acts as history stack) */
-    StateInfo* state;
+    /* Move state history */
+    StateInfo state_stack[MAX_GAME_MOVES];
+    int state_count;
 
     /* Array of past Zobrist keys to detect repetition */
     U64 history_keys[MAX_GAME_MOVES];

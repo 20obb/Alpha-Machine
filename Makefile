@@ -28,11 +28,11 @@ TEST_TARGET = test_runner
 all: release
 
 release: CXXFLAGS := $(CXXFLAGS)
-release: $(TARGET)
+release: clean $(TARGET)
 	@echo "✅  Built $(TARGET) (release)"
 
 debug: CXXFLAGS := $(DBGFLAGS)
-debug: $(TARGET)
+debug: clean $(TARGET)
 	@echo "✅  Built $(TARGET) (debug)"
 
 $(TARGET): $(OBJS) | $(BUILD_DIR)
@@ -53,7 +53,7 @@ $(TEST_TARGET): $(TEST_OBJS) $(LIB_OBJS) | $(BUILD_DIR)
 	$(CXX) $(DBGFLAGS) -o $@ $^ $(LDFLAGS)
 
 test: CXXFLAGS := $(DBGFLAGS)
-test: $(TEST_TARGET)
+test: clean $(TEST_TARGET)
 	@echo "🧪  Running tests..."
 	@./$(TEST_TARGET)
 

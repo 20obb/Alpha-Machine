@@ -195,6 +195,25 @@ void generate_moves(const Position& pos, MoveList& list) {
     generate_piece_moves<KING>  (pos, list, us, target);
 }
 
+void generate_legal_moves(Position& pos, MoveList& list) {
+    MoveList pseudo;
+    generate_moves(pos, pseudo);
+
+    list.clear();
+    Color us = pos.side_to_move();
+
+    for (int i = 0; i < pseudo.count; i++) {
+        Move m = pseudo.moves[i];
+        StateInfo si;
+        pos.make_move(m, si);
+
+        if (!pos.is_attacked(pos.king_square(us), ~us))
+            list.add(m);
+
+        pos.unmake_move(m);
+    }
+}
+
 void generate_captures(const Position& pos, MoveList& list) {
     list.clear();
     Color us = pos.side_to_move();
@@ -228,6 +247,21 @@ void generate_captures(const Position& pos, MoveList& list) {
     generate_piece_moves<ROOK>  (pos, list, us, target);
     generate_piece_moves<QUEEN> (pos, list, us, target);
     generate_piece_moves<KING>  (pos, list, us, target);
+}
+
+bool parse_legal_move(Position& pos, const std::string& text, Move& move_out) {
+    MoveList legal_moves;
+    generate_legal_moves(pos, legal_moves);
+
+    for (int i = 0; i < legal_moves.count; i++) {
+        if (move_to_string(legal_moves.moves[i]) == text) {
+            move_out = legal_moves.moves[i];
+            return true;
+        }
+    }
+
+    move_out = MOVE_NONE;
+    return false;
 }
 
 /* ═══════════════════ Perft ══════════════════════════════════ */

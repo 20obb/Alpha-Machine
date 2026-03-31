@@ -35,7 +35,7 @@ Position::Position() {
     halfmove = 0;
     fullmove = 1;
     zobrist = 0;
-    state = nullptr;
+    state_count = 0;
     history_count = 0;
 }
 
@@ -121,7 +121,7 @@ void Position::set_fen(const std::string& fen) {
         board[sq] = NO_PIECE;
     king_sq[WHITE] = king_sq[BLACK] = NO_SQ;
     zobrist = 0;
-    state = nullptr;
+    state_count = 0;
     history_count = 0;
 
     std::istringstream ss(fen);
@@ -285,16 +285,16 @@ bool Position::is_attacked(Square sq, Color by) const {
  */
 
 void Position::make_move(Move m, StateInfo& si) {
+    StateInfo snapshot;
+
     /* ─── 1. Save The Active State ────────────────────── */
-    si.castling       = castling;
-    si.en_passant     = ep_sq;
-    si.halfmove_clock = halfmove;
-    si.fullmove_number = fullmove;
-    si.captured       = NO_PIECE;
-    si.zobrist_key    = zobrist;
-    si.last_move      = m;
-    si.previous       = state;
-    state = &si;
+    snapshot.castling       = castling;
+    snapshot.en_passant     = ep_sq;
+    snapshot.halfmove_clock = halfmove;
+    snapshot.fullmove_number = fullmove;
+    snapshot.captured       = NO_PIECE;
+    snapshot.zobrist_key    = zobrist;
+    snapshot.last_move      = m;
 
     Square from = move_from(m);
     Square to   = move_to(m);
@@ -336,10 +336,10 @@ void Position::make_move(Move m, StateInfo& si) {
     } else if (mt == MT_EN_PASSANT) {
         /*
          * En Passant Capture: The pawn being actively captured is NOT on the target square!
-         * Rather, it resides one rank directly behind the target (relative to the moving player).
+        * Rather, it resides one rank directly behind the target (relative to the moving player).
          */
         Square cap_sq = (side == WHITE) ? Square(to - 8) : Square(to + 8);
-        si.captured = board[cap_sq];
+        snapshot.captured = board[cap_sq];
         remove_piece(cap_sq);
         move_piece(from, to);
         halfmove = 0;  /* A pawn capture → reset halfmove clock */
@@ -352,7 +352,7 @@ void Position::make_move(Move m, StateInfo& si) {
 
         /* Target square capture verification */
         if (board[to] != NO_PIECE) {
-            si.captured = board[to];
+            snapshot.captured = board[to];
             remove_piece(to);
         }
 
@@ -365,7 +365,7 @@ void Position::make_move(Move m, StateInfo& si) {
 
         /* Target square capture logic */
         if (board[to] != NO_PIECE) {
-            si.captured = board[to];
+            snapshot.captured = board[to];
             remove_piece(to);
             halfmove = 0;
         } else {
@@ -412,6 +412,11 @@ void Position::make_move(Move m, StateInfo& si) {
     /* ─── 6. Catalog Zobrist key into History Database ──── */
     if (history_count < MAX_GAME_MOVES)
         history_keys[history_count++] = zobrist;
+
+    if (state_count < MAX_GAME_MOVES)
+        state_stack[state_count++] = snapshot;
+
+    si = snapshot;
 }
 
 /* ═══════════════════ Unmake Move ═════════════════════════ */
@@ -423,6 +428,11 @@ void Position::make_move(Move m, StateInfo& si) {
  */
 
 void Position::unmake_move(Move m) {
+    if (state_count <= 0)
+        return;
+
+    StateInfo& prev = state_stack[state_count - 1];
+
     /* Step backwards within the History Log */
     history_count--;
 
@@ -448,29 +458,29 @@ void Position::unmake_move(Move m) {
     } else if (mt == MT_EN_PASSANT) {
         Square cap_sq = (side == WHITE) ? Square(to - 8) : Square(to + 8);
         move_piece(to, from);
-        put_piece(state->captured, cap_sq);
+        put_piece(prev.captured, cap_sq);
 
     } else if (mt == MT_PROMOTION) {
         remove_piece(to);
         put_piece(make_piece(side, PAWN), from);
-        if (state->captured != NO_PIECE) {
-            put_piece(state->captured, to);
+        if (prev.captured != NO_PIECE) {
+            put_piece(prev.captured, to);
         }
 
     } else {
         move_piece(to, from);
-        if (state->captured != NO_PIECE) {
-            put_piece(state->captured, to);
+        if (prev.captured != NO_PIECE) {
+            put_piece(prev.captured, to);
         }
     }
 
     /* Restore all scalar variables from the pre-captured snapshot */
-    castling = state->castling;
-    ep_sq    = state->en_passant;
-    halfmove = state->halfmove_clock;
-    fullmove = state->fullmove_number;
-    zobrist  = state->zobrist_key;
-    state    = state->previous;
+    castling = prev.castling;
+    ep_sq    = prev.en_passant;
+    halfmove = prev.halfmove_clock;
+    fullmove = prev.fullmove_number;
+    zobrist  = prev.zobrist_key;
+    state_count--;
 }
 
 /* ═══════════════════ Null Move ═══════════════════════════ */
@@ -481,15 +491,14 @@ void Position::unmake_move(Move m) {
  */
 
 void Position::make_null_move(StateInfo& si) {
-    si.castling       = castling;
-    si.en_passant     = ep_sq;
-    si.halfmove_clock = halfmove;
-    si.fullmove_number = fullmove;
-    si.captured       = NO_PIECE;
-    si.zobrist_key    = zobrist;
-    si.last_move      = MOVE_NULL;
-    si.previous       = state;
-    state = &si;
+    StateInfo snapshot;
+    snapshot.castling       = castling;
+    snapshot.en_passant     = ep_sq;
+    snapshot.halfmove_clock = halfmove;
+    snapshot.fullmove_number = fullmove;
+    snapshot.captured       = NO_PIECE;
+    snapshot.zobrist_key    = zobrist;
+    snapshot.last_move      = MOVE_NULL;
 
     if (ep_sq != NO_SQ) {
         zobrist ^= Zobrist::EnPassantKeys[file_of(ep_sq)];
@@ -504,17 +513,45 @@ void Position::make_null_move(StateInfo& si) {
 
     if (history_count < MAX_GAME_MOVES)
         history_keys[history_count++] = zobrist;
+
+    if (state_count < MAX_GAME_MOVES)
+        state_stack[state_count++] = snapshot;
+
+    si = snapshot;
 }
 
 void Position::unmake_null_move() {
+    if (state_count <= 0)
+        return;
+
+    StateInfo& prev = state_stack[state_count - 1];
+
     history_count--;
     side      = ~side;
-    castling  = state->castling;
-    ep_sq     = state->en_passant;
-    halfmove  = state->halfmove_clock;
-    fullmove  = state->fullmove_number;
-    zobrist   = state->zobrist_key;
-    state     = state->previous;
+    castling  = prev.castling;
+    ep_sq     = prev.en_passant;
+    halfmove  = prev.halfmove_clock;
+    fullmove  = prev.fullmove_number;
+    zobrist   = prev.zobrist_key;
+    state_count--;
+}
+
+void Position::make_move(Move m) {
+    StateInfo si;
+    make_move(m, si);
+}
+
+bool Position::do_move(Move m) {
+    Color us = side;
+    StateInfo si;
+    make_move(m, si);
+
+    if (is_attacked(king_sq[us], ~us)) {
+        unmake_move(m);
+        return false;
+    }
+
+    return true;
 }
 
 /* ═══════════════════ Repetition Detection ═══════════════ */

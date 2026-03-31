@@ -14,28 +14,26 @@
 #include "position.h"
 #include "move.h"
 
+#include <atomic>
 #include <cstdint>
 
-/* ═══════════════════ Search Info ═══════════════════════════ */
+enum OrderingStage : uint8_t {
+    ORDERING_STAGE1 = 0,
+    ORDERING_STAGE2A,
+    ORDERING_STAGE2B
+};
 
-struct SearchInfo {
-    int      depth;          /* Maximum depth */
-    int      nodes;          /* Number of nodes visited */
-    bool     stopped;        /* Has the search been ordered to stop? */
+struct SearchLimits {
+    int            max_depth;         /* Maximum completed depth target */
+    int64_t        movetime_ms;       /* Fixed movetime budget */
+    int64_t        soft_time_ms;      /* Optional soft stop */
+    int64_t        hard_time_ms;      /* Optional hard stop */
+    OrderingStage  ordering_stage;    /* Stage 1 / 2A / 2B benchmark selection */
+    bool           enable_info_output;
 
-    /* Time management context (expanded later) */
-    int64_t  start_time;     /* Start time in milliseconds */
-    int64_t  stop_time;      /* Targeted stop time in milliseconds */
-    bool     time_set;       /* Is there a strict time limit applied? */
-
-    uint64_t tt_probes;      /* Transposition table probes */
-    uint64_t tt_hits;        /* Successful TT key matches */
-    uint64_t tt_cutoffs;     /* TT cutoffs from exact/bound hits */
-    uint64_t tt_stores;      /* TT stores */
-
-    SearchInfo() : depth(MAX_DEPTH), nodes(0), stopped(false),
-                   start_time(0), stop_time(0), time_set(false),
-                   tt_probes(0), tt_hits(0), tt_cutoffs(0), tt_stores(0) {}
+    SearchLimits()
+        : max_depth(MAX_DEPTH), movetime_ms(0), soft_time_ms(0), hard_time_ms(0),
+          ordering_stage(ORDERING_STAGE2B), enable_info_output(false) {}
 };
 
 /* ═══════════════════ Search Result ════════════════════════ */
@@ -44,15 +42,19 @@ struct SearchResult {
     Move best_move;
     int  score;
     int  depth;
-    int  nodes;
+    uint64_t nodes;
     uint64_t tt_probes;
     uint64_t tt_hits;
     uint64_t tt_cutoffs;
     uint64_t tt_stores;
+    int64_t time_ms;
+    bool stopped;
+    bool hard_stopped;
 
     SearchResult()
         : best_move(MOVE_NONE), score(0), depth(0), nodes(0),
-          tt_probes(0), tt_hits(0), tt_cutoffs(0), tt_stores(0) {}
+          tt_probes(0), tt_hits(0), tt_cutoffs(0), tt_stores(0),
+          time_ms(0), stopped(false), hard_stopped(false) {}
 };
 
 /* ═══════════════════ Search Function ═════════════════════ */
@@ -66,6 +68,9 @@ struct SearchResult {
  *
  * Returns: SearchResult pairing the determined best move and its objective evaluation.
  */
-SearchResult search(Position& pos, SearchInfo& info);
+SearchResult search(Position& pos, const SearchLimits& limits,
+                    const std::atomic<bool>* external_stop = nullptr);
+
+const char* ordering_stage_name(OrderingStage stage);
 
 #endif /* SEARCH_H */

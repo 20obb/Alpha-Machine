@@ -1,54 +1,122 @@
 /*
  * search.cpp — Core Search Engine: Alpha-Beta + Iterative Deepening + Quiescence
  * =========================================================================
- *
- * Architecture Hierarchy:
- *   1. Negamax: Simplest fundamental recursive structure.
- *   2. Alpha-Beta: Branches pruning mechanism (eliminates ~90% of useless evaluations).
- *   3. Quiescence: Specialized capture search when depth hits 0 (mitigates horizon effect).
- *   4. Iterative Deepening: Incremental depth-based loop (re-searches at Depth 1, 2, 3...)
- *
- * Full Pipeline:
- *   search() -> iterative_deepening -> alpha_beta -> quiescence
- *
- * Negamax Architecture:
- *   "What is best for me is worse for my opponent."
- *   score = -alpha_beta(...)  <- Perspective flips every recursion level.
- *
- * Alpha-Beta:
- *   - alpha = Best guaranteed score for me so far.
- *   - beta = Best score my opponent will concede to me.
- *   - If score >= beta: The opponent will deliberately avoid this branch -> Beta cutoff.
- *   - If score > alpha: We located a better move -> Increase alpha threshold.
- *
- * Quiescence Search:
- *   At Depth 0, blindly evaluating could be disastrous if a piece is mid-capture.
- *   - Compute "Stand Pat" (static evaluation rating).
- *   - Iteratively evaluate ONLY capture moves.
- *   - Extinguishes the "Horizon Effect", ensuring stability.
  */
 
 #include "search.h"
 #include "evaluate.h"
 #include "movegen.h"
-#include "bitboard.h"
 #include "tt.h"
 
-#include <cstdio>
-#include <chrono>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <limits>
 
-/* ═══════════════════ Timing ═══════════════════════════════ */
+namespace {
+
+constexpr int HASH_MOVE_SCORE = 30000000;
+constexpr int CAPTURE_SCORE_BASE = 20000000;
+constexpr int PROMOTION_SCORE_BASE = 19000000;
+constexpr int KILLER_1_SCORE = 15000000;
+constexpr int KILLER_2_SCORE = 14900000;
+constexpr int HISTORY_SCORE_BASE = 1000;
+
+struct SearchState {
+    explicit SearchState(const SearchLimits& requested_limits,
+                         const std::atomic<bool>* stop_flag)
+        : limits(requested_limits),
+          external_stop(stop_flag),
+          nodes(0),
+          hard_stopped(false),
+          soft_stopped(false),
+          start_time_ms(current_time_ms()),
+          soft_stop_time_ms(0),
+          hard_stop_time_ms(0),
+          tt_probes(0),
+          tt_hits(0),
+          tt_cutoffs(0),
+          tt_stores(0) {
+        std::memset(killers, 0, sizeof(killers));
+        std::memset(history, 0, sizeof(history));
+
+        if (limits.max_depth <= 0)
+            limits.max_depth = MAX_DEPTH;
+
+        if (limits.movetime_ms > 0) {
+            if (limits.hard_time_ms <= 0)
+                limits.hard_time_ms = limits.movetime_ms;
+
+            if (limits.soft_time_ms <= 0) {
+                limits.soft_time_ms = (limits.movetime_ms > 20)
+                    ? (limits.movetime_ms * 9) / 10
+                    : limits.movetime_ms;
+            }
+        }
+
+        if (limits.soft_time_ms > 0)
+            soft_stop_time_ms = start_time_ms + limits.soft_time_ms;
+        if (limits.hard_time_ms > 0)
+            hard_stop_time_ms = start_time_ms + limits.hard_time_ms;
+    }
+
+    SearchLimits limits;
+    const std::atomic<bool>* external_stop;
+    uint64_t nodes;
+    bool hard_stopped;
+    bool soft_stopped;
+    int64_t start_time_ms;
+    int64_t soft_stop_time_ms;
+    int64_t hard_stop_time_ms;
+    uint64_t tt_probes;
+    uint64_t tt_hits;
+    uint64_t tt_cutoffs;
+    uint64_t tt_stores;
+    Move killers[MAX_PLY][2];
+    int history[COLOR_NB][SQUARE_NB][SQUARE_NB];
+
+    static int64_t current_time_ms() {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+    }
+};
+
+struct RootSearchResult {
+    SearchResult result;
+    bool completed;
+
+    RootSearchResult() : completed(false) {}
+};
 
 static int64_t current_time_ms() {
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()).count();
+    return SearchState::current_time_ms();
 }
 
-static void check_time(SearchInfo& info) {
-    if (info.time_set && current_time_ms() >= info.stop_time)
-        info.stopped = true;
+static void check_hard_stop(SearchState& state) {
+    if (state.hard_stopped)
+        return;
+
+    if (state.external_stop && state.external_stop->load(std::memory_order_relaxed)) {
+        state.hard_stopped = true;
+        return;
+    }
+
+    if (state.hard_stop_time_ms > 0 && current_time_ms() >= state.hard_stop_time_ms)
+        state.hard_stopped = true;
+}
+
+static bool soft_stop_reached(SearchState& state) {
+    if (state.soft_stop_time_ms <= 0)
+        return false;
+
+    if (current_time_ms() >= state.soft_stop_time_ms) {
+        state.soft_stopped = true;
+        return true;
+    }
+
+    return false;
 }
 
 static inline bool leaves_king_in_check(const Position& pos, Color us) {
@@ -59,52 +127,83 @@ static inline int mated_in(int ply) {
     return -VALUE_MATE + ply;
 }
 
-/* ═══════════════════ Move Ordering (Simple) ═══════════════ */
-/*
- * Move ordering dramatically dictates alpha-beta performance yield.
- * Testing better moves first achieves Beta cutoffs rapidly.
- *
- * V1 Configuration:
- *   - Captures: Sequenced by MVV-LVA (Most Valuable Victim, Least Valuable Attacker)
- *     Pawn taking Queen = Highest possible priority.
- *     Queen taking Pawn = Lowest capture priority.
- *   - Quiet Moves: Baseline priority score 0 (upgraded later via killer/history).
- */
-
-static constexpr int HASH_MOVE_SCORE = 30000000;
-static constexpr int CAPTURE_SCORE_BASE = 10000000;
-static constexpr int PROMOTION_SCORE_BASE = 9000000;
-
-static void score_moves(const Position& pos, MoveList& list, Move hash_move = MOVE_NONE) {
-    for (int i = 0; i < list.count; i++) {
-        Move m = list.moves[i];
-        Square to = move_to(m);
-        Piece captured = pos.piece_on(to);
-
-        if (m == hash_move) {
-            list.scores[i] = HASH_MOVE_SCORE;
-        } else if (captured != NO_PIECE) {
-            /* MVV-LVA: victim_value * 10 - attacker_value */
-            Piece moved = pos.piece_on(move_from(m));
-            int victim_val = PieceValue[type_of(captured)];
-            int attacker_val = PieceValue[type_of(moved)];
-            list.scores[i] = victim_val * 10 - attacker_val + CAPTURE_SCORE_BASE;
-            /* Captures outrank quiet moves; hash move outranks everything. */
-        } else if (move_type(m) == MT_EN_PASSANT) {
-            list.scores[i] = CAPTURE_SCORE_BASE + 500;  /* En passant behaves like pawn capture. */
-        } else if (move_type(m) == MT_PROMOTION) {
-            list.scores[i] = PROMOTION_SCORE_BASE + PieceValue[promotion_type(m)];
-        } else {
-            list.scores[i] = 0;
-        }
-    }
+static bool is_capture_move(const Position& pos, Move m) {
+    return move_type(m) == MT_EN_PASSANT || pos.piece_on(move_to(m)) != NO_PIECE;
 }
 
-/*
- * pick_move: Incrementally extract best remaining move (Selection Sort variation).
- * Vastly superior to sorting the complete array natively, since we usually only
- * extract 1 or 2 moves before triggering a Beta cutoff.
- */
+static bool is_tactical_move(const Position& pos, Move m) {
+    return move_type(m) == MT_PROMOTION || is_capture_move(pos, m);
+}
+
+static bool is_quiet_move(const Position& pos, Move m) {
+    return !is_tactical_move(pos, m);
+}
+
+static void update_killers(SearchState& state, int ply, Move move) {
+    if (state.limits.ordering_stage < ORDERING_STAGE2A || ply >= MAX_PLY)
+        return;
+
+    if (state.killers[ply][0] == move)
+        return;
+
+    state.killers[ply][1] = state.killers[ply][0];
+    state.killers[ply][0] = move;
+}
+
+static void update_history(SearchState& state, Color us, Move move, int depth) {
+    if (state.limits.ordering_stage < ORDERING_STAGE2B)
+        return;
+
+    int& entry = state.history[us][move_from(move)][move_to(move)];
+    int bonus = depth * depth;
+
+    if (entry > std::numeric_limits<int>::max() - bonus)
+        entry = std::numeric_limits<int>::max();
+    else
+        entry += bonus;
+}
+
+static int score_move(const Position& pos, Move move, Move hash_move,
+                      const SearchState& state, int ply) {
+    if (move == hash_move)
+        return HASH_MOVE_SCORE;
+
+    if (move_type(move) == MT_PROMOTION)
+        return PROMOTION_SCORE_BASE + PieceValue[promotion_type(move)];
+
+    if (move_type(move) == MT_EN_PASSANT)
+        return CAPTURE_SCORE_BASE + 500;
+
+    Piece captured = pos.piece_on(move_to(move));
+    if (captured != NO_PIECE) {
+        Piece moved = pos.piece_on(move_from(move));
+        int victim_val = PieceValue[type_of(captured)];
+        int attacker_val = PieceValue[type_of(moved)];
+        return CAPTURE_SCORE_BASE + victim_val * 10 - attacker_val;
+    }
+
+    if (state.limits.ordering_stage >= ORDERING_STAGE2A && ply < MAX_PLY) {
+        if (move == state.killers[ply][0])
+            return KILLER_1_SCORE;
+        if (move == state.killers[ply][1])
+            return KILLER_2_SCORE;
+    }
+
+    if (state.limits.ordering_stage >= ORDERING_STAGE2B) {
+        int history_score = state.history[pos.side_to_move()][move_from(move)][move_to(move)];
+        if (history_score > 0)
+            return HISTORY_SCORE_BASE + history_score;
+    }
+
+    return 0;
+}
+
+static void score_moves(const Position& pos, MoveList& list, const SearchState& state,
+                        int ply, Move hash_move = MOVE_NONE) {
+    for (int i = 0; i < list.count; i++)
+        list.scores[i] = score_move(pos, list.moves[i], hash_move, state, ply);
+}
+
 static void pick_move(MoveList& list, int start) {
     int best_idx = start;
     int best_score = list.scores[start];
@@ -122,36 +221,70 @@ static void pick_move(MoveList& list, int start) {
     }
 }
 
-/* ═══════════════════ Quiescence Search ════════════════════ */
-/*
- * Recursive search constrained purely to capture moves.
- *
- * Stand Pat:
- *   The positional evaluation score unconditionally provided as a baseline.
- *   If it's already formidable -> Decline further capture calculations.
- *   Maintains algorithmic sanity when threatened with bad exchanges.
- */
+static void fill_result_totals(SearchResult& result, const SearchState& state) {
+    result.nodes = state.nodes;
+    result.tt_probes = state.tt_probes;
+    result.tt_hits = state.tt_hits;
+    result.tt_cutoffs = state.tt_cutoffs;
+    result.tt_stores = state.tt_stores;
+    result.time_ms = current_time_ms() - state.start_time_ms;
+    result.stopped = state.soft_stopped || state.hard_stopped;
+    result.hard_stopped = state.hard_stopped;
+}
 
-static int quiescence(Position& pos, int alpha, int beta, SearchInfo& info) {
-    info.nodes++;
+static void print_iteration_info(const SearchResult& result) {
+    int64_t elapsed = result.time_ms > 0 ? result.time_ms : 1;
+    int64_t nps = static_cast<int64_t>(result.nodes * 1000 / elapsed);
 
-    /* Enforce termination clock every 2048 node cycles */
-    if ((info.nodes & 2047) == 0) check_time(info);
-    if (info.stopped) return 0;
+    if (result.score > VALUE_MATE - MAX_PLY) {
+        int mate_in = (VALUE_MATE - result.score + 1) / 2;
+        std::printf("info depth %d score mate %d nodes %llu time %lld nps %lld pv %s\n",
+                    result.depth, mate_in,
+                    static_cast<unsigned long long>(result.nodes),
+                    static_cast<long long>(elapsed),
+                    static_cast<long long>(nps),
+                    move_to_string(result.best_move).c_str());
+    } else if (result.score < -VALUE_MATE + MAX_PLY) {
+        int mate_in = -(VALUE_MATE + result.score) / 2;
+        std::printf("info depth %d score mate %d nodes %llu time %lld nps %lld pv %s\n",
+                    result.depth, mate_in,
+                    static_cast<unsigned long long>(result.nodes),
+                    static_cast<long long>(elapsed),
+                    static_cast<long long>(nps),
+                    move_to_string(result.best_move).c_str());
+    } else {
+        std::printf("info depth %d score cp %d nodes %llu time %lld nps %lld pv %s\n",
+                    result.depth, result.score,
+                    static_cast<unsigned long long>(result.nodes),
+                    static_cast<long long>(elapsed),
+                    static_cast<long long>(nps),
+                    move_to_string(result.best_move).c_str());
+    }
 
-    /* Repetition and draw recognition */
-    if (pos.is_repetition() || pos.is_fifty_move_draw()) return 0;
+    std::fflush(stdout);
+}
 
-    /* Stand Pat */
+static int quiescence(Position& pos, int alpha, int beta, SearchState& state) {
+    state.nodes++;
+
+    if ((state.nodes & 2047ULL) == 0)
+        check_hard_stop(state);
+    if (state.hard_stopped)
+        return 0;
+
+    if (pos.is_repetition() || pos.is_fifty_move_draw())
+        return 0;
+
     int stand_pat = evaluate(pos);
 
-    if (stand_pat >= beta) return beta;
-    if (stand_pat > alpha) alpha = stand_pat;
+    if (stand_pat >= beta)
+        return beta;
+    if (stand_pat > alpha)
+        alpha = stand_pat;
 
-    /* Formulate capture moves strictly */
     MoveList captures;
     generate_captures(pos, captures);
-    score_moves(pos, captures);
+    score_moves(pos, captures, state, MAX_PLY);
 
     Color us = pos.side_to_move();
 
@@ -165,81 +298,66 @@ static int quiescence(Position& pos, int alpha, int beta, SearchInfo& info) {
             continue;
         }
 
-        int score = -quiescence(pos, -beta, -alpha, info);
+        int score = -quiescence(pos, -beta, -alpha, state);
         pos.unmake_move(captures.moves[i]);
 
-        if (info.stopped) return 0;
+        if (state.hard_stopped)
+            return 0;
 
-        if (score >= beta) return score;
-        if (score > alpha) alpha = score;
+        if (score >= beta)
+            return score;
+        if (score > alpha)
+            alpha = score;
     }
 
     return alpha;
 }
 
-/* ═══════════════════ Alpha-Beta ═══════════════════════════ */
-/*
- * Primary recursive search hub.
- *
- * Parameters:
- *   pos    — Target spatial matrix
- *   depth  — Remaining vertical cascade limitation
- *   alpha  — Ground floor guaranteed evaluation boundary
- *   beta   — Maximum upper boundary opponent will accept
- *   info   — System control data
- *
- * Returns: Complete sub-node evaluation perspective.
- */
-
 static int alpha_beta(Position& pos, int depth, int alpha, int beta,
-                      int ply, SearchInfo& info) {
-    /* ─── Termination Overrides ──────────────────────────────── */
+                      int ply, SearchState& state) {
+    if ((state.nodes & 2047ULL) == 0)
+        check_hard_stop(state);
+    if (state.hard_stopped)
+        return 0;
 
-    if ((info.nodes & 2047) == 0) check_time(info);
-    if (info.stopped) return 0;
+    if (pos.is_repetition() || pos.is_fifty_move_draw() || pos.is_material_draw())
+        return 0;
 
-    /* Institutional draw states */
-    if (pos.is_repetition() || pos.is_fifty_move_draw()) return 0;
-    if (pos.is_material_draw()) return 0;
+    if (depth <= 0)
+        return quiescence(pos, alpha, beta, state);
 
-    /* Depth horizon breach -> Escalate to Quiescence fallback */
-    if (depth <= 0) return quiescence(pos, alpha, beta, info);
-
-    info.nodes++;
+    state.nodes++;
 
     int alpha_orig = alpha;
     Move tt_move = MOVE_NONE;
     TTEntry tt_entry;
 
-    info.tt_probes++;
+    state.tt_probes++;
     if (g_tt.probe(pos.key(), tt_entry)) {
-        info.tt_hits++;
+        state.tt_hits++;
         tt_move = tt_entry.best_move;
 
         if (tt_entry.depth >= depth) {
             int tt_score = TranspositionTable::score_from_tt(tt_entry.score, ply);
 
             if (tt_entry.bound == TT_BOUND_EXACT) {
-                info.tt_cutoffs++;
+                state.tt_cutoffs++;
                 return tt_score;
             }
             if (tt_entry.bound == TT_BOUND_LOWER && tt_score >= beta) {
-                info.tt_cutoffs++;
+                state.tt_cutoffs++;
                 return tt_score;
             }
             if (tt_entry.bound == TT_BOUND_UPPER && tt_score <= alpha) {
-                info.tt_cutoffs++;
+                state.tt_cutoffs++;
                 return tt_score;
             }
         }
     }
 
-    /* ─── Move Expansion ────────────────────── */
     MoveList moves;
     generate_moves(pos, moves);
-
-    /* Sequencing operations */
-    score_moves(pos, moves, tt_move);
+    score_moves(pos, moves, state, ply, tt_move);
 
     Color us = pos.side_to_move();
     Move best_move = MOVE_NONE;
@@ -249,7 +367,6 @@ static int alpha_beta(Position& pos, int depth, int alpha, int beta,
     for (int i = 0; i < moves.count; i++) {
         pick_move(moves, i);
 
-        /* Legality filtering */
         StateInfo si;
         pos.make_move(moves.moves[i], si);
         if (leaves_king_in_check(pos, us)) {
@@ -259,164 +376,151 @@ static int alpha_beta(Position& pos, int depth, int alpha, int beta,
 
         found_legal = true;
 
-        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, ply + 1, info);
+        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, ply + 1, state);
         pos.unmake_move(moves.moves[i]);
 
-        if (info.stopped) return 0;
+        if (state.hard_stopped)
+            return 0;
 
         if (score > best_score) {
             best_score = score;
             best_move = moves.moves[i];
         }
 
-        if (score > alpha) {
+        if (score > alpha)
             alpha = score;
-        }
 
-        if (alpha >= beta)
+        if (alpha >= beta) {
+            if (is_quiet_move(pos, moves.moves[i])) {
+                update_killers(state, ply, moves.moves[i]);
+                update_history(state, us, moves.moves[i], depth);
+            }
             break;
+        }
     }
 
     if (!found_legal) {
         int terminal = pos.in_check() ? mated_in(ply) : 0;
         g_tt.store(pos.key(), depth, terminal, MOVE_NONE, TT_BOUND_EXACT, ply);
-        info.tt_stores++;
+        state.tt_stores++;
         return terminal;
     }
 
     TTBound bound = TT_BOUND_EXACT;
-    if (best_score <= alpha_orig) bound = TT_BOUND_UPPER;
-    else if (best_score >= beta) bound = TT_BOUND_LOWER;
+    if (best_score <= alpha_orig)
+        bound = TT_BOUND_UPPER;
+    else if (best_score >= beta)
+        bound = TT_BOUND_LOWER;
 
     g_tt.store(pos.key(), depth, best_score, best_move, bound, ply);
-    info.tt_stores++;
+    state.tt_stores++;
 
     return best_score;
 }
 
-/* ═══════════════════ Root Alpha-Beta ═════════════════════ */
-/*
- * Iteration Zero search vector. Tracks absolute 'best' root move structurally.
- */
+static RootSearchResult root_search(Position& pos, const MoveList& legal_moves,
+                                    int depth, SearchState& state) {
+    RootSearchResult out;
+    out.result.depth = depth;
 
-static SearchResult root_search(Position& pos, int depth, SearchInfo& info) {
-    SearchResult result;
-    result.depth = depth;
+    if (legal_moves.count == 0) {
+        out.result.best_move = MOVE_NONE;
+        out.result.score = pos.in_check() ? mated_in(0) : 0;
+        fill_result_totals(out.result, state);
+        out.completed = true;
+        return out;
+    }
 
-    MoveList moves;
-    generate_moves(pos, moves);
-    score_moves(pos, moves, g_tt.probe_move(pos.key()));
+    MoveList moves = legal_moves;
+    score_moves(pos, moves, state, 0, g_tt.probe_move(pos.key()));
 
     int alpha = -VALUE_INFINITE;
-    int beta  =  VALUE_INFINITE;
-    Color us = pos.side_to_move();
-    bool found_legal = false;
+    int beta = VALUE_INFINITE;
 
     for (int i = 0; i < moves.count; i++) {
+        check_hard_stop(state);
+        if (state.hard_stopped)
+            return out;
+
         pick_move(moves, i);
 
         StateInfo si;
         pos.make_move(moves.moves[i], si);
-        if (leaves_king_in_check(pos, us)) {
-            pos.unmake_move(moves.moves[i]);
-            continue;
-        }
-
-        found_legal = true;
-        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, 1, info);
+        int score = -alpha_beta(pos, depth - 1, -beta, -alpha, 1, state);
         pos.unmake_move(moves.moves[i]);
 
-        if (info.stopped) break;
+        if (state.hard_stopped)
+            return out;
 
-        if (score > alpha) {
+        if (i == 0 || score > alpha) {
             alpha = score;
-            result.best_move = moves.moves[i];
-            result.score = score;
+            out.result.best_move = moves.moves[i];
+            out.result.score = score;
         }
     }
 
-    if (!found_legal) {
-        result.score = pos.in_check() ? mated_in(0) : 0;
-    }
+    g_tt.store(pos.key(), depth, out.result.score, out.result.best_move, TT_BOUND_EXACT, 0);
+    state.tt_stores++;
 
-    if (!info.stopped) {
-        g_tt.store(pos.key(), depth, result.score, result.best_move, TT_BOUND_EXACT, 0);
-        info.tt_stores++;
-    }
-
-    result.nodes = info.nodes;
-    return result;
+    fill_result_totals(out.result, state);
+    out.completed = true;
+    return out;
 }
 
-/* ═══════════════════ Iterative Deepening ═════════════════ */
-/*
- * Layer-cake depth parsing sequence (Depth 1, 2, 3...).
- *
- * Method rationale:
- *   1. Guarantee instantaneous move response availability against clock termination.
- *   2. Previous depth computations drastically streamline subsequent deeper move orders (TT prep).
- *   3. Insignificant total overhead latency (~10%) due to exponential node scaling at max depth.
- */
+}  // namespace
 
-SearchResult search(Position& pos, SearchInfo& info) {
-    SearchResult best_result;
-    info.nodes = 0;
-    info.stopped = false;
-    info.tt_probes = 0;
-    info.tt_hits = 0;
-    info.tt_cutoffs = 0;
-    info.tt_stores = 0;
+const char* ordering_stage_name(OrderingStage stage) {
+    switch (stage) {
+        case ORDERING_STAGE1: return "stage1";
+        case ORDERING_STAGE2A: return "stage2a";
+        case ORDERING_STAGE2B: return "stage2b";
+        default: return "unknown";
+    }
+}
+
+SearchResult search(Position& pos, const SearchLimits& limits,
+                    const std::atomic<bool>* external_stop) {
+    SearchState state(limits, external_stop);
+    SearchResult fallback_result;
+    SearchResult last_completed_result;
+    bool have_completed_iteration = false;
+
     g_tt.new_search();
 
-    int64_t search_start = current_time_ms();
+    MoveList legal_moves;
+    generate_legal_moves(pos, legal_moves);
 
-    for (int depth = 1; depth <= info.depth; depth++) {
-        SearchResult result = root_search(pos, depth, info);
+    if (legal_moves.count == 0) {
+        fallback_result.best_move = MOVE_NONE;
+        fallback_result.score = pos.in_check() ? mated_in(0) : 0;
+        fill_result_totals(fallback_result, state);
+        return fallback_result;
+    }
 
-        if (info.stopped) break;
+    fallback_result.best_move = legal_moves.moves[0];
+    fallback_result.score = 0;
+    fill_result_totals(fallback_result, state);
 
-        best_result = result;
+    for (int depth = 1; depth <= state.limits.max_depth; depth++) {
+        if (have_completed_iteration && soft_stop_reached(state))
+            break;
 
-        /* ─── Standard UCI Log Outputs ────────────────────── */
-        int64_t elapsed = current_time_ms() - search_start;
-        if (elapsed == 0) elapsed = 1;
-        int64_t nps = (int64_t)info.nodes * 1000 / elapsed;
+        RootSearchResult iteration = root_search(pos, legal_moves, depth, state);
+        if (state.hard_stopped || !iteration.completed)
+            break;
 
-        /* Standardize mate detection thresholds */
-        if (result.score > VALUE_MATE - MAX_PLY) {
-            int mate_in = (VALUE_MATE - result.score + 1) / 2;
-            printf("info depth %d score mate %d nodes %d time %lld nps %lld pv %s\n",
-                   depth, mate_in, info.nodes,
-                   (long long)elapsed, (long long)nps,
-                   move_to_string(result.best_move).c_str());
-        } else if (result.score < -VALUE_MATE + MAX_PLY) {
-            int mate_in = -(VALUE_MATE + result.score) / 2;
-            printf("info depth %d score mate %d nodes %d time %lld nps %lld pv %s\n",
-                   depth, mate_in, info.nodes,
-                   (long long)elapsed, (long long)nps,
-                   move_to_string(result.best_move).c_str());
-        } else {
-            printf("info depth %d score cp %d nodes %d time %lld nps %lld pv %s\n",
-                   depth, result.score, info.nodes,
-                   (long long)elapsed, (long long)nps,
-                   move_to_string(result.best_move).c_str());
-        }
-        fflush(stdout);
+        last_completed_result = iteration.result;
+        have_completed_iteration = true;
 
-        /* Terminate Deepening if terminal horizon confirmed */
-        if (result.score > VALUE_MATE - MAX_PLY ||
-            result.score < -VALUE_MATE + MAX_PLY)
+        if (state.limits.enable_info_output)
+            print_iteration_info(last_completed_result);
+
+        if (last_completed_result.score > VALUE_MATE - MAX_PLY ||
+            last_completed_result.score < -VALUE_MATE + MAX_PLY)
             break;
     }
 
-    best_result.nodes = info.nodes;
-    best_result.tt_probes = info.tt_probes;
-    best_result.tt_hits = info.tt_hits;
-    best_result.tt_cutoffs = info.tt_cutoffs;
-    best_result.tt_stores = info.tt_stores;
-
-    printf("bestmove %s\n", move_to_string(best_result.best_move).c_str());
-    fflush(stdout);
-
-    return best_result;
+    SearchResult result = have_completed_iteration ? last_completed_result : fallback_result;
+    fill_result_totals(result, state);
+    return result;
 }

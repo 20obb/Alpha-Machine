@@ -14,8 +14,14 @@
 /* Generate all pseudo-legal moves and add them to the provided list */
 void generate_moves(const Position& pos, MoveList& list);
 
+/* Generate only legal moves */
+void generate_legal_moves(Position& pos, MoveList& list);
+
 /* Generate ONLY capturing moves (used in Quiescence Search) */
 void generate_captures(const Position& pos, MoveList& list);
+
+/* Parse a legal move from UCI long algebraic format */
+bool parse_legal_move(Position& pos, const std::string& text, Move& move_out);
 
 /* Run Perft (Performance Test) for a specific depth and return the number of valid leaf nodes */
 U64 perft(Position& pos, int depth);
