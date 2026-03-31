@@ -37,7 +37,7 @@ static void generate_pawn_moves(const Position& pos, MoveList& list, Bitboard ta
     constexpr Direction Up = (Us == WHITE) ? NORTH : SOUTH;
     constexpr Direction UpRight = (Us == WHITE) ? NORTH_EAST : SOUTH_EAST;
     constexpr Direction UpLeft = (Us == WHITE) ? NORTH_WEST : SOUTH_WEST;
-    constexpr Rank Rank7 = (Us == WHITE) ? RANK_7 : RANK_2;
+    constexpr Rank PromotionRank = (Us == WHITE) ? RANK_8 : RANK_1;
 
     Bitboard pawns = pos.pieces(Us, PAWN);
     Bitboard empty = ~pos.all_pieces();
@@ -50,7 +50,7 @@ static void generate_pawn_moves(const Position& pos, MoveList& list, Bitboard ta
     while (single_pushes) {
         Square to = pop_lsb(single_pushes);
         Square from = to - Up;
-        if (rank_of(to) == Rank7 + Up) {
+        if (rank_of(to) == PromotionRank) {
             add_promotions(list, from, to);
         } else {
             add_move(list, from, to);
@@ -75,7 +75,7 @@ static void generate_pawn_moves(const Position& pos, MoveList& list, Bitboard ta
     while (cap_right) {
         Square to = pop_lsb(cap_right);
         Square from = to - UpRight;
-        if (rank_of(to) == Rank7 + Up) {
+        if (rank_of(to) == PromotionRank) {
             add_promotions(list, from, to);
         } else {
             add_move(list, from, to);
@@ -89,7 +89,7 @@ static void generate_pawn_moves(const Position& pos, MoveList& list, Bitboard ta
     while (cap_left) {
         Square to = pop_lsb(cap_left);
         Square from = to - UpLeft;
-        if (rank_of(to) == Rank7 + Up) {
+        if (rank_of(to) == PromotionRank) {
             add_promotions(list, from, to);
         } else {
             add_move(list, from, to);
