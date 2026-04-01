@@ -125,6 +125,24 @@ namespace {
 constexpr int BENCH_TT_MB = 16;
 constexpr int BENCH_RUNS_PER_MODE = 10;
 
+struct GoCommand {
+    int max_depth;
+    int64_t movetime_ms;
+    int64_t soft_time_ms;
+    int64_t hard_time_ms;
+    int64_t wtime_ms;
+    int64_t btime_ms;
+    int64_t winc_ms;
+    int64_t binc_ms;
+    int movestogo;
+    bool infinite;
+
+    GoCommand()
+        : max_depth(MAX_DEPTH), movetime_ms(0), soft_time_ms(0), hard_time_ms(0),
+          wtime_ms(-1), btime_ms(-1), winc_ms(0), binc_ms(0), movestogo(0),
+          infinite(false) {}
+};
+
 struct Stats {
     uint64_t min_value;
     uint64_t max_value;
@@ -240,6 +258,75 @@ struct UciSession {
         return true;
     }
 
+    static GoCommand parse_go_command(const std::vector<std::string>& tokens) {
+        GoCommand command;
+
+        for (std::size_t i = 1; i < tokens.size(); i++) {
+            if (tokens[i] == "depth" && i + 1 < tokens.size()) {
+                command.max_depth = std::max(1, std::atoi(tokens[++i].c_str()));
+            } else if (tokens[i] == "movetime" && i + 1 < tokens.size()) {
+                command.movetime_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "softtime" && i + 1 < tokens.size()) {
+                command.soft_time_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "hardtime" && i + 1 < tokens.size()) {
+                command.hard_time_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "wtime" && i + 1 < tokens.size()) {
+                command.wtime_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "btime" && i + 1 < tokens.size()) {
+                command.btime_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "winc" && i + 1 < tokens.size()) {
+                command.winc_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "binc" && i + 1 < tokens.size()) {
+                command.binc_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
+            } else if (tokens[i] == "movestogo" && i + 1 < tokens.size()) {
+                command.movestogo = std::max(0, std::atoi(tokens[++i].c_str()));
+            } else if (tokens[i] == "infinite") {
+                command.infinite = true;
+            }
+        }
+
+        return command;
+    }
+
+    static void apply_clock_limits(const Position& pos, const GoCommand& command,
+                                   SearchLimits& limits) {
+        if (command.infinite)
+            return;
+
+        if (command.movetime_ms > 0) {
+            limits.movetime_ms = command.movetime_ms;
+            return;
+        }
+
+        int64_t side_time_ms = (pos.side_to_move() == WHITE) ? command.wtime_ms : command.btime_ms;
+        int64_t side_inc_ms = (pos.side_to_move() == WHITE) ? command.winc_ms : command.binc_ms;
+
+        if (side_time_ms < 0)
+            return;
+
+        if (side_time_ms <= 1) {
+            limits.soft_time_ms = 1;
+            limits.hard_time_ms = 1;
+            return;
+        }
+
+        int moves_to_go = (command.movestogo > 0) ? command.movestogo : 30;
+        int64_t reserve_ms = std::clamp<int64_t>(side_time_ms / 20, 5, 200);
+        int64_t usable_ms = std::max<int64_t>(side_time_ms - reserve_ms, 1);
+        int64_t base_ms = usable_ms / std::max(moves_to_go, 1);
+        int64_t increment_share_ms = side_inc_ms / 2;
+
+        int64_t soft_ms = std::max<int64_t>(base_ms + increment_share_ms, 1);
+        soft_ms = std::min<int64_t>(soft_ms, usable_ms);
+
+        int64_t hard_cap_ms = std::max<int64_t>(usable_ms - 1, 1);
+        int64_t hard_ms = std::max<int64_t>(soft_ms + std::max<int64_t>(soft_ms / 2, 5), soft_ms);
+        hard_ms = std::min<int64_t>(hard_ms, hard_cap_ms);
+
+        limits.soft_time_ms = soft_ms;
+        limits.hard_time_ms = hard_ms;
+    }
+
     void cmd_go(const std::vector<std::string>& tokens) {
         stop_and_join();
 
@@ -252,19 +339,11 @@ struct UciSession {
         SearchLimits limits;
         limits.enable_info_output = true;
         limits.ordering_stage = ORDERING_STAGE2B;
-        limits.max_depth = MAX_DEPTH;
-
-        for (std::size_t i = 1; i < tokens.size(); i++) {
-            if (tokens[i] == "depth" && i + 1 < tokens.size()) {
-                limits.max_depth = std::max(1, std::atoi(tokens[++i].c_str()));
-            } else if (tokens[i] == "movetime" && i + 1 < tokens.size()) {
-                limits.movetime_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
-            } else if (tokens[i] == "softtime" && i + 1 < tokens.size()) {
-                limits.soft_time_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
-            } else if (tokens[i] == "hardtime" && i + 1 < tokens.size()) {
-                limits.hard_time_ms = std::max<int64_t>(0, std::atoll(tokens[++i].c_str()));
-            }
-        }
+        GoCommand command = parse_go_command(tokens);
+        limits.max_depth = command.max_depth;
+        limits.soft_time_ms = command.soft_time_ms;
+        limits.hard_time_ms = command.hard_time_ms;
+        apply_clock_limits(position_copy, command, limits);
 
         stop_flag.store(false, std::memory_order_relaxed);
         worker = std::thread([this, position_copy, limits]() mutable {

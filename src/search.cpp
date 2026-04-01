@@ -22,6 +22,8 @@ constexpr int PROMOTION_SCORE_BASE = 19000000;
 constexpr int KILLER_1_SCORE = 15000000;
 constexpr int KILLER_2_SCORE = 14900000;
 constexpr int HISTORY_SCORE_BASE = 1000;
+constexpr uint64_t TIME_CHECK_INTERVAL = 64;
+constexpr uint64_t TIME_CHECK_MASK = TIME_CHECK_INTERVAL - 1;
 
 struct SearchState {
     explicit SearchState(const SearchLimits& requested_limits,
@@ -45,14 +47,20 @@ struct SearchState {
             limits.max_depth = MAX_DEPTH;
 
         if (limits.movetime_ms > 0) {
+            int64_t movetime_safety_margin_ms =
+                std::clamp<int64_t>(limits.movetime_ms / 50, 5, 50);
+
             if (limits.hard_time_ms <= 0)
-                limits.hard_time_ms = limits.movetime_ms;
+                limits.hard_time_ms = std::max<int64_t>(limits.movetime_ms - movetime_safety_margin_ms, 1);
 
             if (limits.soft_time_ms <= 0) {
                 limits.soft_time_ms = (limits.movetime_ms > 20)
                     ? (limits.movetime_ms * 9) / 10
-                    : limits.movetime_ms;
+                    : limits.hard_time_ms;
             }
+
+            if (limits.soft_time_ms > limits.hard_time_ms)
+                limits.soft_time_ms = limits.hard_time_ms;
         }
 
         if (limits.soft_time_ms > 0)
@@ -107,6 +115,11 @@ static void check_hard_stop(SearchState& state) {
         state.hard_stopped = true;
 }
 
+static inline void maybe_check_hard_stop(SearchState& state) {
+    if ((state.nodes & TIME_CHECK_MASK) == 0)
+        check_hard_stop(state);
+}
+
 static bool soft_stop_reached(SearchState& state) {
     if (state.soft_stop_time_ms <= 0)
         return false;
@@ -117,6 +130,28 @@ static bool soft_stop_reached(SearchState& state) {
     }
 
     return false;
+}
+
+static bool should_start_next_iteration(SearchState& state, int64_t last_iteration_ms) {
+    if (soft_stop_reached(state))
+        return false;
+
+    if (state.hard_stop_time_ms <= 0 || last_iteration_ms <= 0)
+        return true;
+
+    int64_t remaining_ms = state.hard_stop_time_ms - current_time_ms();
+    if (remaining_ms <= 1) {
+        state.soft_stopped = true;
+        return false;
+    }
+
+    int64_t predicted_next_iteration_ms = std::max<int64_t>(last_iteration_ms * 2, 1);
+    if (remaining_ms <= predicted_next_iteration_ms) {
+        state.soft_stopped = true;
+        return false;
+    }
+
+    return true;
 }
 
 static inline bool leaves_king_in_check(const Position& pos, Color us) {
@@ -267,8 +302,7 @@ static void print_iteration_info(const SearchResult& result) {
 static int quiescence(Position& pos, int alpha, int beta, SearchState& state) {
     state.nodes++;
 
-    if ((state.nodes & 2047ULL) == 0)
-        check_hard_stop(state);
+    maybe_check_hard_stop(state);
     if (state.hard_stopped)
         return 0;
 
@@ -289,6 +323,11 @@ static int quiescence(Position& pos, int alpha, int beta, SearchState& state) {
     Color us = pos.side_to_move();
 
     for (int i = 0; i < captures.count; i++) {
+        if ((i & 7) == 0)
+            check_hard_stop(state);
+        if (state.hard_stopped)
+            return 0;
+
         pick_move(captures, i);
 
         StateInfo si;
@@ -315,8 +354,7 @@ static int quiescence(Position& pos, int alpha, int beta, SearchState& state) {
 
 static int alpha_beta(Position& pos, int depth, int alpha, int beta,
                       int ply, SearchState& state) {
-    if ((state.nodes & 2047ULL) == 0)
-        check_hard_stop(state);
+    maybe_check_hard_stop(state);
     if (state.hard_stopped)
         return 0;
 
@@ -365,6 +403,11 @@ static int alpha_beta(Position& pos, int depth, int alpha, int beta,
     bool found_legal = false;
 
     for (int i = 0; i < moves.count; i++) {
+        if ((i & 7) == 0)
+            check_hard_stop(state);
+        if (state.hard_stopped)
+            return 0;
+
         pick_move(moves, i);
 
         StateInfo si;
@@ -501,8 +544,11 @@ SearchResult search(Position& pos, const SearchLimits& limits,
     fallback_result.score = 0;
     fill_result_totals(fallback_result, state);
 
+    int64_t previous_completed_time_ms = 0;
+    int64_t last_iteration_time_ms = 0;
+
     for (int depth = 1; depth <= state.limits.max_depth; depth++) {
-        if (have_completed_iteration && soft_stop_reached(state))
+        if (have_completed_iteration && !should_start_next_iteration(state, last_iteration_time_ms))
             break;
 
         RootSearchResult iteration = root_search(pos, legal_moves, depth, state);
@@ -511,6 +557,8 @@ SearchResult search(Position& pos, const SearchLimits& limits,
 
         last_completed_result = iteration.result;
         have_completed_iteration = true;
+        last_iteration_time_ms = last_completed_result.time_ms - previous_completed_time_ms;
+        previous_completed_time_ms = last_completed_result.time_ms;
 
         if (state.limits.enable_info_output)
             print_iteration_info(last_completed_result);
